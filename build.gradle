@@ -1,0 +1,71 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow'
+}
+
+group = 'gg.lode'
+
+def loaderVersion = '1.0.0'
+version = loaderVersion
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(21) }
+}
+
+processResources {
+    inputs.property("version", loaderVersion)
+    filesMatching("paper-plugin.yml") {
+        expand("version": loaderVersion)
+    }
+}
+
+task processJavaSources(type: Copy) {
+    inputs.property("version", loaderVersion)
+    from "src/main/java"
+    into "$buildDir/generated-sources/java"
+    filter { line -> line.replace('${VERSION}', loaderVersion) }
+}
+
+sourceSets.main.java.srcDirs = ["$buildDir/generated-sources/java"]
+compileJava.dependsOn processJavaSources
+
+File implKeyDir = file("$rootDir/.cloud-keys")
+task bundleImplBlob(type: Copy) {
+    dependsOn ':Sign-Impl:generateKeys'
+    from(implKeyDir) {
+        include 'aes.key'
+        include 'ed25519-public.key'
+        include 'loader-token.key'
+    }
+    into "$buildDir/generated-resources/cloud"
+}
+
+sourceSets.main.resources.srcDirs += "$buildDir/generated-resources"
+processResources.dependsOn bundleImplBlob
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://jitpack.io' }
+    maven { url = 'https://repo.papermc.io/repository/maven-public/' }
+}
+
+dependencies {
+    compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    implementation project(':Sign-API')
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+shadowJar {
+    archiveBaseName.set('Sign-Loader')
+    archiveVersion.set('')
+    archiveClassifier.set('')
+    mergeServiceFiles()
+}
+
+jar {
+    enabled = false
+    dependsOn shadowJar
+}

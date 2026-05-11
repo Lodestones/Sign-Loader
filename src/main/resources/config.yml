@@ -1,0 +1,7 @@
+# Which impl version this loader fetches from lode.gg.
+# 'auto' = follow the cloud manifest. '<ver>' = pin a specific impl.
+loader_version: auto
+
+# Release channels the loader will accept (comma-separated). Defaults to
+# 'release'. Add 'beta' and/or 'alpha' to opt into pre-release builds.
+loader_channels: release

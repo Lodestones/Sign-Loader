@@ -1,0 +1,20 @@
+name: Sign
+version: '${version}'
+main: gg.lode.sign.SignLoader
+api-version: '1.21'
+authors: [ Apollo, SkyyIsCool, https://lode.gg/ ]
+description: Replace vanilla player nametags with fast & customizable text entities!
+dependencies:
+  server:
+    PlaceholderAPI:
+      required: false
+      load: BEFORE
+    TAB:
+      required: false
+      load: BEFORE
+    voicechat:
+      required: false
+      load: BEFORE
+    Amplifier:
+      required: false
+      load: BEFORE
