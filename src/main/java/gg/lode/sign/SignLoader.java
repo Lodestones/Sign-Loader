@@ -24,6 +24,7 @@ import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
+import java.util.List;
 
 public final class SignLoader extends JavaPlugin {
 
@@ -112,7 +113,7 @@ public final class SignLoader extends JavaPlugin {
         Files.write(runtimeJar, jarBytes, StandardOpenOption.TRUNCATE_EXISTING);
 
         URL[] urls = { runtimeJar.toUri().toURL() };
-        implLoader = new URLClassLoader(urls, getClass().getClassLoader());
+        implLoader = new ChildFirstClassLoader(urls, getClass().getClassLoader());
         Class<?> entry = Class.forName(BOOTSTRAP_CLASS, true, implLoader);
         Object instance = entry.getDeclaredConstructor().newInstance();
         if (!(instance instanceof SignBootstrap)) {
@@ -181,5 +182,50 @@ public final class SignLoader extends JavaPlugin {
 
     private static final class InvalidBlobException extends Exception {
         InvalidBlobException(String message) { super(message); }
+    }
+
+    // Child-first classloader so the impl jar's bundled classes win over any
+    // stale copies shaded into sibling plugins. A small allowlist stays
+    // parent-first for shared-contract types — the bootstrap interface and
+    // loader-internal helpers must come from the same classloader as the host
+    // so instanceof checks succeed.
+    private static final class ChildFirstClassLoader extends URLClassLoader {
+        private static final List<String> PARENT_FIRST_PREFIXES = List.of(
+                "java.", "javax.", "jdk.", "sun.",
+                "org.bukkit.", "net.minecraft.", "io.papermc.", "com.destroystokyo.",
+                // Platform-shared libs that appear in Paper API signatures.
+                "net.kyori.", "io.netty.", "org.slf4j.", "com.mojang.brigadier.",
+                // Sign-API is bundled in both the loader jar and the impl jar.
+                // Parent-first keeps them as ONE Class<?> so the impl's
+                // provider setup and consumers' lookups share one singleton.
+                "gg.lode.sign.api.",
+                "gg.lode.sign.loader.",
+                "gg.lode.sign.SignLoader"
+        );
+
+        ChildFirstClassLoader(URL[] urls, ClassLoader parent) {
+            super(urls, parent);
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            synchronized (getClassLoadingLock(name)) {
+                Class<?> loaded = findLoadedClass(name);
+                if (loaded == null) {
+                    boolean parentFirst = false;
+                    for (String prefix : PARENT_FIRST_PREFIXES) {
+                        if (name.startsWith(prefix)) { parentFirst = true; break; }
+                    }
+                    if (parentFirst) {
+                        loaded = super.loadClass(name, false);
+                    } else {
+                        try { loaded = findClass(name); }
+                        catch (ClassNotFoundException notInUrl) { loaded = super.loadClass(name, false); }
+                    }
+                }
+                if (resolve) resolveClass(loaded);
+                return loaded;
+            }
+        }
     }
 }

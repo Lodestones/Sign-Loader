@@ -96,11 +96,12 @@ public final class CloudBlobLoader {
             Path cachePath = cachePathFor(manifest.version);
             byte[] cached = readCacheIfMatches(cachePath, manifest.sha256);
             if (cached != null) {
-                logger.info("Loaded impl blob from local cache.");
+                logger.info("Loaded impl " + manifest.version + " from cache.");
                 return cached;
             }
             byte[] bytes = downloadFromManifest(manifest);
             writeCache(cachePath, bytes);
+            logger.info("Downloaded impl " + manifest.version + ".");
             return bytes;
         }
         byte[] fallback = readAnyCache();
