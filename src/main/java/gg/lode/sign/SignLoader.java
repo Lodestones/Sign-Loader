@@ -2,6 +2,7 @@ package gg.lode.sign;
 
 import gg.lode.sign.api.bootstrap.SignBootstrap;
 import gg.lode.sign.loader.CloudBlobLoader;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import javax.crypto.Cipher;
@@ -32,6 +33,7 @@ public final class SignLoader extends JavaPlugin {
     private static final String ED25519_PUB_RESOURCE = "cloud/ed25519-public.key";
     private static final String LOADER_TOKEN_RESOURCE = "cloud/loader-token.key";
     private static final String BOOTSTRAP_CLASS = "gg.lode.sign.Sign";
+    private static final String LOADER_CONFIG_FILE = "loader.yml";
 
     private static final byte[] MAGIC = "SGBLOB\0\0".getBytes(StandardCharsets.UTF_8);
     private static final int FORMAT_VERSION = 1;
@@ -96,12 +98,12 @@ public final class SignLoader extends JavaPlugin {
         if (!dataFolder.exists() && !dataFolder.mkdirs()) {
             throw new IOException("Could not create data folder: " + dataFolder);
         }
-        saveDefaultConfig();
-        String pinnedVersion = getConfig().getString("loader_version", "auto");
+        YamlConfiguration loaderCfg = loadLoaderConfig(dataFolder);
+        String pinnedVersion = loaderCfg.getString("loader_version", "auto");
 
         String loaderToken = new String(readResource(LOADER_TOKEN_RESOURCE), StandardCharsets.UTF_8).trim();
         String mcVersion = detectMinecraftVersion();
-        String loaderChannels = getConfig().getString("loader_channels", "release");
+        String loaderChannels = loaderCfg.getString("loader_channels", "release");
         CloudBlobLoader blobLoader = new CloudBlobLoader(getLogger(), "sign", loaderToken, mcVersion, loaderChannels);
         byte[] blob = blobLoader.resolve(pinnedVersion);
         byte[] aesKey = readResource(AES_KEY_RESOURCE);
@@ -120,6 +122,17 @@ public final class SignLoader extends JavaPlugin {
             throw new IllegalStateException(BOOTSTRAP_CLASS + " does not implement SignBootstrap");
         }
         return (SignBootstrap) instance;
+    }
+
+    private YamlConfiguration loadLoaderConfig(File dataFolder) throws IOException {
+        File cfgFile = new File(dataFolder, LOADER_CONFIG_FILE);
+        if (!cfgFile.exists()) {
+            try (InputStream in = getResource(LOADER_CONFIG_FILE)) {
+                if (in == null) throw new IOException("Missing bundled resource: " + LOADER_CONFIG_FILE);
+                Files.copy(in, cfgFile.toPath());
+            }
+        }
+        return YamlConfiguration.loadConfiguration(cfgFile);
     }
 
     private String detectMinecraftVersion() {
