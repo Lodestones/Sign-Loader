@@ -50,9 +50,11 @@ public final class SignLoader extends JavaPlugin {
             bootstrap = loadBootstrap();
             bootstrap.onLoad(this);
         } catch (InvalidBlobException ibe) {
+            bootstrap = null;
             loadFailureReason = "Impl blob is invalid (" + ibe.getMessage() + "). Refusing to load.";
             getLogger().severe(loadFailureReason);
         } catch (Throwable t) {
+            bootstrap = null;
             loadFailureReason = "Failed to load Sign implementation: " + t.getMessage();
             getLogger().severe(loadFailureReason);
             t.printStackTrace();
