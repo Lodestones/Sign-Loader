@@ -1,3 +1,8 @@
+import java.security.KeyFactory
+import java.security.Signature
+import java.security.spec.PKCS8EncodedKeySpec
+import java.util.Base64
+
 plugins {
     id 'java'
     id 'com.gradleup.shadow'
@@ -68,4 +73,67 @@ shadowJar {
 jar {
     enabled = false
     dependsOn shadowJar
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Loader auto-update publishing.
+//
+// Signs the built loader jar with the SAME Ed25519 key that signs impl blobs
+// (.cloud-keys/ed25519-private.key — private stays here, never shipped), then
+// uploads jar + base64 signature to lode.gg. Servers running an older loader
+// with `auto_update_loader: true` verify the signature against the public key
+// they already bundle, then stage the update. Run this whenever the loader
+// jar changes:  SIGN_RELEASE_TOKEN=lrk_… gradlew -p Sign-Loader publishLoader
+// ─────────────────────────────────────────────────────────────────────────
+ext.signAndUploadLoader = { proj, String pluginId, String tokenEnvVar, File jar, String versionStr ->
+    if (!jar.exists()) throw new GradleException("Loader jar not built: " + jar)
+    File edPrivKeyFile = new File(file("$rootDir/.cloud-keys"), "ed25519-private.key")
+    if (!edPrivKeyFile.exists()) throw new GradleException("Missing signing key: " + edPrivKeyFile)
+
+    byte[] jarBytes = jar.bytes
+    def edPriv = KeyFactory.getInstance("Ed25519").generatePrivate(new PKCS8EncodedKeySpec(edPrivKeyFile.bytes))
+    Signature s = Signature.getInstance("Ed25519"); s.initSign(edPriv); s.update(jarBytes)
+    String signatureB64 = Base64.encoder.encodeToString(s.sign())
+
+    String token = (proj.findProperty("releaseToken") ?: System.getenv(tokenEnvVar)) as String
+    if (!token) throw new GradleException("Missing ${tokenEnvVar} env var (or -PreleaseToken=<key>).")
+    String baseUrl = ((proj.findProperty("releaseUrl") ?: System.getenv("SIGN_RELEASE_URL")) ?: "https://lode.gg") as String
+    baseUrl = baseUrl.replaceAll('/+$', '')
+
+    String boundary = "----LoaderPublish" + System.currentTimeMillis()
+    String CRLF = "\r\n"
+    ByteArrayOutputStream body = new ByteArrayOutputStream()
+    body.write(("--" + boundary + CRLF).getBytes("UTF-8"))
+    body.write(('Content-Disposition: form-data; name="version"' + CRLF + CRLF).getBytes("UTF-8"))
+    body.write((versionStr + CRLF).getBytes("UTF-8"))
+    body.write(("--" + boundary + CRLF).getBytes("UTF-8"))
+    body.write(('Content-Disposition: form-data; name="signature"' + CRLF + CRLF).getBytes("UTF-8"))
+    body.write((signatureB64 + CRLF).getBytes("UTF-8"))
+    body.write(("--" + boundary + CRLF).getBytes("UTF-8"))
+    body.write(('Content-Disposition: form-data; name="jar"; filename="' + jar.name + '"' + CRLF).getBytes("UTF-8"))
+    body.write(("Content-Type: application/java-archive" + CRLF + CRLF).getBytes("UTF-8"))
+    body.write(jarBytes)
+    body.write((CRLF + "--" + boundary + "--" + CRLF).getBytes("UTF-8"))
+    byte[] payload = body.toByteArray()
+
+    URL uploadUrl = new URL(baseUrl + "/api/admin/plugins/${pluginId}/loader/upload")
+    proj.logger.lifecycle("Uploading signed loader {} ({} bytes) to {}", jar.name, jarBytes.length, uploadUrl)
+    HttpURLConnection up = (HttpURLConnection) uploadUrl.openConnection()
+    up.setRequestMethod("POST"); up.setDoOutput(true)
+    up.setConnectTimeout(15_000); up.setReadTimeout(120_000)
+    up.setRequestProperty("Authorization", "Bearer " + token)
+    up.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary)
+    up.setFixedLengthStreamingMode(payload.length)
+    up.outputStream.withCloseable { it.write(payload) }
+    int code = up.responseCode
+    String respBody = (code >= 200 && code < 300 ? up.inputStream : up.errorStream)?.text ?: ""
+    if (code < 200 || code >= 300) throw new GradleException("Loader upload failed (HTTP " + code + "): " + respBody)
+    proj.logger.lifecycle("Published signed loader v{}. {}", versionStr, respBody)
+}
+
+task publishLoader(dependsOn: shadowJar) {
+    description = "Sign + upload the loader jar to lode.gg (enables loader auto-update)."
+    doLast {
+        signAndUploadLoader(project, "sign", "SIGN_RELEASE_TOKEN", shadowJar.archiveFile.get().asFile, loaderVersion)
+    }
 }
