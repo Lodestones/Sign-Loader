@@ -5,3 +5,11 @@ loader_version: auto
 # Release channels the loader will accept (comma-separated). Defaults to
 # 'release'. Add 'beta' and/or 'alpha' to opt into pre-release builds.
 loader_channels: release
+
+# Whether the loader keeps itself up to date.
+#
+# true  — on startup, check lode.gg for a newer loader jar and, if one is
+#         published (and its Ed25519 signature verifies), stage it into
+#         plugins/update/ so the server applies it on the next restart. (default)
+# false — never self-update; the loader jar on disk is used as-is.
+auto_update_loader: true

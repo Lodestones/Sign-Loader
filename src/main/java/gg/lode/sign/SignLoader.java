@@ -2,6 +2,7 @@ package gg.lode.sign;
 
 import gg.lode.sign.api.bootstrap.SignBootstrap;
 import gg.lode.sign.loader.CloudBlobLoader;
+import gg.lode.sign.loader.CloudBlobLoader.LoaderUpdate;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -19,12 +20,15 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.KeyFactory;
 import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 
 public final class SignLoader extends JavaPlugin {
@@ -43,6 +47,11 @@ public final class SignLoader extends JavaPlugin {
     private URLClassLoader implLoader;
     private Path runtimeJar;
     private String loadFailureReason;
+
+    // Captured during loadBootstrap so onEnable can run a background self-update.
+    private CloudBlobLoader cloudLoader;
+    private byte[] edPubKey;
+    private boolean autoUpdateLoader;
 
     @Override
     public void onLoad() {
@@ -76,6 +85,15 @@ public final class SignLoader extends JavaPlugin {
             getLogger().severe("Failed to enable Sign implementation: " + t.getMessage());
             t.printStackTrace();
             getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+        // Best-effort loader self-update on a background thread — never blocks
+        // enable, never disables the plugin on failure. Staged jars apply on
+        // the next server restart via Paper's plugins/update/ folder.
+        if (autoUpdateLoader && cloudLoader != null) {
+            Thread t = new Thread(this::runSelfUpdate, "Sign-Loader-Update");
+            t.setDaemon(true);
+            t.start();
         }
     }
 
@@ -110,6 +128,11 @@ public final class SignLoader extends JavaPlugin {
         byte[] blob = blobLoader.resolve(pinnedVersion);
         byte[] aesKey = readResource(AES_KEY_RESOURCE);
         byte[] edPub = readResource(ED25519_PUB_RESOURCE);
+
+        // Stash for the onEnable self-update pass.
+        this.cloudLoader = blobLoader;
+        this.edPubKey = edPub;
+        this.autoUpdateLoader = loaderCfg.getBoolean("auto_update_loader", true);
 
         byte[] jarBytes = verifyAndDecrypt(blob, aesKey, edPub);
 
@@ -193,6 +216,87 @@ public final class SignLoader extends JavaPlugin {
         } catch (javax.crypto.AEADBadTagException badTag) {
             throw new InvalidBlobException("AES-GCM tag mismatch (wrong key or tampered ciphertext)");
         }
+    }
+
+    /**
+     * Check lode.gg for a newer loader jar; if one is published and its Ed25519
+     * signature verifies against the bundled blob public key, stage it into
+     * plugins/update/ with the raw jar. Entirely best-effort: any failure is
+     * logged and swallowed.
+     */
+    private void runSelfUpdate() {
+        try {
+            LoaderUpdate update = cloudLoader.fetchLoaderUpdate();
+            if (update == null || update.version == null) return;
+
+            String current = getPluginMeta().getVersion();
+            if (compareVersions(update.version, current) <= 0) return; // not newer
+            if (update.signature == null || update.signature.isBlank()) {
+                getLogger().info("Loader update " + update.version
+                        + " available but unsigned — skipping (manual update required).");
+                return;
+            }
+
+            byte[] rawJar = cloudLoader.downloadLoaderRaw(update.sha256);
+            if (rawJar == null) return;
+
+            if (!verifyEd25519(rawJar, Base64.getDecoder().decode(update.signature), edPubKey)) {
+                getLogger().warning("Loader update " + update.version
+                        + " signature verification FAILED — refusing to stage it.");
+                return;
+            }
+
+            Path updateDir = Paths.get("plugins", "update");
+            Files.createDirectories(updateDir);
+            Path target = updateDir.resolve(currentJarFileName());
+            Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+            Files.write(tmp, rawJar);
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            getLogger().info("Staged loader update " + update.version
+                    + " — it applies on the next server restart.");
+        } catch (Throwable t) {
+            getLogger().warning("Loader self-update skipped: " + t.getMessage());
+        }
+    }
+
+    /** File name of this loader jar on disk, for the plugins/update/ target. */
+    private String currentJarFileName() {
+        try {
+            return new File(getClass().getProtectionDomain().getCodeSource().getLocation().toURI()).getName();
+        } catch (Exception e) {
+            return "Sign-Loader.jar";
+        }
+    }
+
+    private static boolean verifyEd25519(byte[] data, byte[] signature, byte[] edPubEncoded) {
+        try {
+            PublicKey edPub = KeyFactory.getInstance("Ed25519").generatePublic(new X509EncodedKeySpec(edPubEncoded));
+            Signature verifier = Signature.getInstance("Ed25519");
+            verifier.initVerify(edPub);
+            verifier.update(data);
+            return verifier.verify(signature);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Compare dotted versions numerically; non-numeric tails ignored. Returns
+     *  >0 if a newer than b, <0 if older, 0 if equal. */
+    static int compareVersions(String a, String b) {
+        String[] pa = a.replaceAll("[^0-9.].*$", "").split("\\.");
+        String[] pb = b.replaceAll("[^0-9.].*$", "").split("\\.");
+        int len = Math.max(pa.length, pb.length);
+        for (int i = 0; i < len; i++) {
+            int va = i < pa.length ? parseIntSafe(pa[i]) : 0;
+            int vb = i < pb.length ? parseIntSafe(pb[i]) : 0;
+            if (va != vb) return Integer.compare(va, vb);
+        }
+        return 0;
+    }
+
+    private static int parseIntSafe(String s) {
+        try { return s.isEmpty() ? 0 : Integer.parseInt(s); }
+        catch (NumberFormatException e) { return 0; }
     }
 
     private static final class InvalidBlobException extends Exception {

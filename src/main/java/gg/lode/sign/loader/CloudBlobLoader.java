@@ -37,6 +37,8 @@ public final class CloudBlobLoader {
     private final String channels;
     private final URI manifestUri;
     private final String blobUrlPrefix;
+    private final URI loaderUpdateUri;
+    private final URI loaderRawUri;
     private final String cacheNameSalt;
 
     public CloudBlobLoader(Logger logger, String pluginId, String loaderToken, String mcVersion, String channels) {
@@ -56,6 +58,8 @@ public final class CloudBlobLoader {
         }
         this.manifestUri = URI.create(BASE_URL + pluginId + "/impl/manifest" + query);
         this.blobUrlPrefix = BASE_URL + pluginId + "/impl/";
+        this.loaderUpdateUri = URI.create(BASE_URL + pluginId + "/loader/update");
+        this.loaderRawUri = URI.create(BASE_URL + pluginId + "/loader/update.jar");
         this.cacheNameSalt = "blob:v1:" + pluginId
                 + ":mc=" + (mcVersion == null ? "any" : mcVersion)
                 + ":ch=" + (this.channels == null ? "any" : this.channels) + ":";
@@ -228,5 +232,68 @@ public final class CloudBlobLoader {
 
     private static final class Manifest {
         String version; String blobUrl; String sha256;
+    }
+
+    /**
+     * Fetch the published loader auto-update metadata, or null if none is
+     * published or the cloud is unreachable (auto-update is best-effort —
+     * a failed check never blocks the running loader).
+     */
+    public LoaderUpdate fetchLoaderUpdate() {
+        try {
+            HttpRequest req = HttpRequest.newBuilder(loaderUpdateUri)
+                    .timeout(MANIFEST_TIMEOUT)
+                    .header("Accept", "application/json")
+                    .header(LOADER_HEADER, loaderToken).GET().build();
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) return null;
+            LoaderUpdate u = new LoaderUpdate();
+            Matcher matcher = STRING_FIELD.matcher(resp.body());
+            while (matcher.find()) {
+                switch (matcher.group(1)) {
+                    case "version"   -> u.version   = matcher.group(2);
+                    case "sha256"    -> u.sha256    = matcher.group(2);
+                    case "signature" -> u.signature = matcher.group(2);
+                    default -> {}
+                }
+            }
+            return u.version != null ? u : null;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (IOException ioe) {
+            return null;
+        }
+    }
+
+    /**
+     * Download the raw (non-injected) loader jar bytes, verifying the SHA-256
+     * against the published value. Returns null on any failure.
+     */
+    public byte[] downloadLoaderRaw(String expectedSha256) {
+        try {
+            HttpRequest req = HttpRequest.newBuilder(loaderRawUri).timeout(BLOB_TIMEOUT)
+                    .header(LOADER_HEADER, loaderToken).GET().build();
+            HttpResponse<byte[]> resp = http.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() != 200) return null;
+            byte[] bytes = resp.body();
+            if (expectedSha256 != null && !sha256Hex(bytes).equalsIgnoreCase(expectedSha256)) {
+                logger.warning("Loader update checksum mismatch — skipping self-update.");
+                return null;
+            }
+            return bytes;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (IOException ioe) {
+            return null;
+        }
+    }
+
+    /** Published loader auto-update metadata. */
+    public static final class LoaderUpdate {
+        public String version;
+        public String sha256;
+        public String signature; // base64 Ed25519 over the raw jar bytes; null ⇒ don't update
     }
 }
