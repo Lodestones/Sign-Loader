@@ -18,3 +18,12 @@ dependencies:
     Amplifier:
       required: false
       load: BEFORE
+    # Without these, Paper's isolated plugin classloader hides ViaVersion's
+    # classes from the shaded PacketEvents, whose Via accessor then NPEs on
+    # every incoming connection when ViaVersion is installed.
+    ViaVersion:
+      required: false
+      load: BEFORE
+    ViaBackwards:
+      required: false
+      load: BEFORE
