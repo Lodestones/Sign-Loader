@@ -13,6 +13,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.List;
 import java.util.Locale;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -40,6 +41,8 @@ public final class CloudBlobLoader {
     private final URI loaderUpdateUri;
     private final URI loaderRawUri;
     private final String cacheNameSalt;
+    /** Envelope magic prefix used to validate cache-fallback candidates; null skips the check. */
+    private byte[] expectedMagic;
 
     public CloudBlobLoader(Logger logger, String pluginId, String loaderToken, String mcVersion, String channels) {
         this.logger = logger;
@@ -63,6 +66,11 @@ public final class CloudBlobLoader {
         this.cacheNameSalt = "blob:v1:" + pluginId
                 + ":mc=" + (mcVersion == null ? "any" : mcVersion)
                 + ":ch=" + (this.channels == null ? "any" : this.channels) + ":";
+    }
+
+    /** Set the blob envelope magic so cache-fallback candidates can be validated. */
+    public void expectedMagic(byte[] magic) {
+        this.expectedMagic = magic;
     }
 
     private static String normalizeChannels(String raw) {
@@ -95,25 +103,26 @@ public final class CloudBlobLoader {
     }
 
     private byte[] resolveFromManifest() throws IOException, InterruptedException {
-        Manifest manifest = fetchManifest();
-        if (manifest != null) {
-            Path cachePath = cachePathFor(manifest.version);
-            byte[] cached = readCacheIfMatches(cachePath, manifest.sha256);
-            if (cached != null) {
-                logger.info("Loaded impl " + manifest.version + " from cache.");
-                return cached;
+        Manifest m;
+        try {
+            m = fetchManifest();
+        } catch (NoBlobException | CloudUnavailableException settledOrDown) {
+            // Fall back to the newest valid cached blob so an outage (or a gap
+            // in published versions) doesn't take the plugin down with it.
+            byte[] fallback = readAnyCache();
+            if (fallback != null) {
+                logger.warning("Manifest unavailable (" + settledOrDown.getMessage() + ") — using cached blob.");
+                return fallback;
             }
-            byte[] bytes = downloadFromManifest(manifest);
-            writeCache(cachePath, bytes);
-            logger.info("Downloaded impl " + manifest.version + ".");
-            return bytes;
+            throw settledOrDown;
         }
-        byte[] fallback = readAnyCache();
-        if (fallback != null) {
-            logger.warning("Cloud manifest unavailable — falling back to last cached impl blob.");
-            return fallback;
-        }
-        throw new IOException("Cloud manifest unavailable and no cached blob on disk.");
+        Path cp = cachePathFor(m.version);
+        byte[] cached = readCacheIfMatches(cp, m.sha256);
+        if (cached != null) { logger.info("Loaded impl " + m.version + " from cache."); return cached; }
+        byte[] bytes = downloadFromManifest(m);
+        writeCache(cp, bytes);
+        logger.info("Downloaded impl " + m.version + ".");
+        return bytes;
     }
 
     private byte[] resolvePinned(String version) throws IOException, InterruptedException {
@@ -133,21 +142,26 @@ public final class CloudBlobLoader {
     }
 
     private Manifest fetchManifest() throws IOException, InterruptedException {
-        HttpRequest req = HttpRequest.newBuilder(manifestUri)
-                .timeout(MANIFEST_TIMEOUT)
-                .header("Accept", "application/json")
-                .header(LOADER_HEADER, loaderToken).GET().build();
+        HttpRequest req = HttpRequest.newBuilder(manifestUri).timeout(MANIFEST_TIMEOUT)
+                .header("Accept", "application/json").header(LOADER_HEADER, loaderToken).GET().build();
         HttpResponse<String> resp;
-        try { resp = http.send(req, HttpResponse.BodyHandlers.ofString()); }
-        catch (IOException ioe) {
-            logger.warning("Cloud manifest fetch threw: " + ioe.getMessage());
-            return null;
+        try {
+            resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        } catch (IOException ioe) {
+            throw new CloudUnavailableException("could not reach lode.gg (" + ioe.getMessage() + ")", ioe);
+        }
+        // 404 is lode.gg saying "nothing published matches this server" — a
+        // settled answer with its own explanation, not an outage.
+        if (resp.statusCode() == 404) {
+            String detail = extractField(resp.body(), "error");
+            throw new NoBlobException(detail != null ? detail : "no blob matches this server", describeRequest());
         }
         if (resp.statusCode() != 200) {
-            logger.warning("Cloud manifest returned HTTP " + resp.statusCode());
-            return null;
+            throw new CloudUnavailableException("lode.gg returned HTTP " + resp.statusCode() + " for the impl manifest");
         }
-        return parseManifest(resp.body());
+        Manifest parsed = parseManifest(resp.body());
+        if (parsed == null) throw new CloudUnavailableException("lode.gg returned a malformed impl manifest");
+        return parsed;
     }
 
     private byte[] downloadFromManifest(Manifest manifest) throws IOException, InterruptedException {
@@ -186,6 +200,21 @@ public final class CloudBlobLoader {
         return (m.version != null && m.blobUrl != null) ? m : null;
     }
 
+    private static String extractField(String body, String field) {
+        if (body == null) return null;
+        Matcher matcher = STRING_FIELD.matcher(body);
+        while (matcher.find()) {
+            if (matcher.group(1).equals(field)) return matcher.group(2);
+        }
+        return null;
+    }
+
+    /** e.g. "Minecraft 26.2, channel alpha" — what we asked lode.gg for. */
+    public String describeRequest() {
+        return "Minecraft " + (mcVersion == null ? "unknown" : mcVersion)
+                + ", channel " + (channels == null ? "release" : channels);
+    }
+
     private Path cachePathFor(String version) {
         String name = sha256Hex((cacheNameSalt + version).getBytes(StandardCharsets.UTF_8));
         return CACHE_DIR.resolve(name);
@@ -196,18 +225,45 @@ public final class CloudBlobLoader {
             if (!Files.isRegularFile(path)) return null;
             byte[] bytes = Files.readAllBytes(path);
             if (expectedSha256Hex != null && !sha256Hex(bytes).equalsIgnoreCase(expectedSha256Hex)) return null;
+            if (expectedSha256Hex == null && !looksLikeBlob(bytes)) return null;
             return bytes;
         } catch (IOException ioe) { return null; }
     }
 
+    /**
+     * Newest-first sweep of the cache dir: skip in-flight temp files, validate
+     * the envelope magic, and delete anything invalid so one bad file can never
+     * poison offline boot again. Returns the newest valid blob, or null.
+     */
     private byte[] readAnyCache() {
         if (!Files.isDirectory(CACHE_DIR)) return null;
+        List<Path> candidates;
         try (var stream = Files.list(CACHE_DIR)) {
-            return stream.filter(Files::isRegularFile)
-                    .max((a, b) -> Long.compare(a.toFile().lastModified(), b.toFile().lastModified()))
-                    .map(p -> { try { return Files.readAllBytes(p); } catch (IOException ioe) { return null; } })
-                    .orElse(null);
+            candidates = stream.filter(Files::isRegularFile)
+                    .filter(p -> !p.getFileName().toString().endsWith(".tmp"))
+                    .sorted((a, b) -> Long.compare(b.toFile().lastModified(), a.toFile().lastModified()))
+                    .toList();
         } catch (IOException ioe) { return null; }
+        for (Path candidate : candidates) {
+            byte[] bytes;
+            try { bytes = Files.readAllBytes(candidate); } catch (IOException ioe) { continue; }
+            if (!looksLikeBlob(bytes)) {
+                logger.warning("Discarding invalid cache entry " + candidate.getFileName() + " (not a blob).");
+                try { Files.deleteIfExists(candidate); } catch (IOException ignored) { }
+                continue;
+            }
+            return bytes;
+        }
+        return null;
+    }
+
+    private boolean looksLikeBlob(byte[] bytes) {
+        if (expectedMagic == null) return bytes.length > 0;
+        if (bytes.length < expectedMagic.length) return false;
+        for (int i = 0; i < expectedMagic.length; i++) {
+            if (bytes[i] != expectedMagic[i]) return false;
+        }
+        return true;
     }
 
     private void writeCache(Path path, byte[] bytes) {
@@ -228,6 +284,31 @@ public final class CloudBlobLoader {
             for (byte b : digest) sb.append(String.format(Locale.ROOT, "%02x", b));
             return sb.toString();
         } catch (Exception e) { throw new IllegalStateException("SHA-256 unavailable", e); }
+    }
+
+    /**
+     * lode.gg answered, and the answer is that nothing it has published fits
+     * this server. Retrying cannot change that.
+     */
+    public static final class NoBlobException extends IOException {
+        private final String request;
+
+        public NoBlobException(String message, String request) {
+            super(message);
+            this.request = request;
+        }
+
+        /** What this server asked for, for the operator-facing report. */
+        public String request() { return request; }
+    }
+
+    /**
+     * lode.gg could not be reached, or answered with a server error. Unlike
+     * {@link NoBlobException} this may well succeed on the next try.
+     */
+    public static final class CloudUnavailableException extends IOException {
+        public CloudUnavailableException(String message) { super(message); }
+        public CloudUnavailableException(String message, Throwable cause) { super(message, cause); }
     }
 
     private static final class Manifest {

@@ -59,11 +59,15 @@ public final class SignLoader extends JavaPlugin {
             bootstrap = loadBootstrap();
             bootstrap.onLoad(this);
         } catch (InvalidBlobException ibe) {
-            bootstrap = null;
             loadFailureReason = "Impl blob is invalid (" + ibe.getMessage() + "). Refusing to load.";
             getLogger().severe(loadFailureReason);
+        } catch (CloudBlobLoader.NoBlobException noBlob) {
+            loadFailureReason = "No Sign build is available for this server (" + noBlob.getMessage() + ").";
+            reportNoBlob(noBlob);
+        } catch (CloudBlobLoader.CloudUnavailableException down) {
+            loadFailureReason = "Could not reach lode.gg (" + down.getMessage() + ").";
+            reportCloudUnavailable(down);
         } catch (Throwable t) {
-            bootstrap = null;
             loadFailureReason = "Failed to load Sign implementation: " + t.getMessage();
             getLogger().severe(loadFailureReason);
             t.printStackTrace();
@@ -113,6 +117,54 @@ public final class SignLoader extends JavaPlugin {
         }
     }
 
+    /**
+     * lode.gg answered but has no build matching this server — a settled
+     * answer, so point the operator at the causes they can actually change.
+     */
+    private void reportNoBlob(CloudBlobLoader.NoBlobException noBlob) {
+        getLogger().severe("=============================================");
+        getLogger().severe("Sign could not find a build for this server.");
+        getLogger().severe("");
+        getLogger().severe("lode.gg said: " + noBlob.getMessage());
+        getLogger().severe("This server asked for: " + noBlob.request());
+        getLogger().severe("");
+        getLogger().severe("That usually means one of:");
+        getLogger().severe("  - No Sign build has been published for your");
+        getLogger().severe("    Minecraft version yet, or for your server software.");
+        getLogger().severe("  - loader_channels in loader.yml names a channel with");
+        getLogger().severe("    nothing published in it (default is 'release').");
+        getLogger().severe("  - loader_version in loader.yml pins a version that no");
+        getLogger().severe("    longer exists. Set it back to 'auto' to take the latest.");
+        getLogger().severe("");
+        getLogger().severe("Nothing is wrong with your network — lode.gg replied,");
+        getLogger().severe("it simply has no matching build.");
+        getLogger().severe("Check https://lode.gg/plugin/sign for supported versions.");
+        getLogger().severe("=============================================");
+    }
+
+    /**
+     * lode.gg could not be reached. Distinct from having no build: this one is
+     * very likely temporary, and the operator should not go hunting through
+     * their config for a cause that is not there.
+     */
+    private void reportCloudUnavailable(CloudBlobLoader.CloudUnavailableException down) {
+        getLogger().severe("=============================================");
+        getLogger().severe("Sign could not download its implementation.");
+        getLogger().severe("");
+        getLogger().severe("Reason: " + down.getMessage());
+        getLogger().severe("");
+        getLogger().severe("lode.gg could not be reached or did not answer properly.");
+        getLogger().severe("This is usually temporary. It can mean:");
+        getLogger().severe("  - lode.gg is down or having problems right now.");
+        getLogger().severe("  - This machine has no outbound internet access, or a");
+        getLogger().severe("    firewall/proxy is blocking https://lode.gg.");
+        getLogger().severe("  - DNS on this machine cannot resolve lode.gg.");
+        getLogger().severe("");
+        getLogger().severe("No valid cached build was on disk either, so nothing");
+        getLogger().severe("could be loaded offline. Restart the server to try again.");
+        getLogger().severe("=============================================");
+    }
+
     private SignBootstrap loadBootstrap() throws Exception {
         File dataFolder = getDataFolder();
         if (!dataFolder.exists() && !dataFolder.mkdirs()) {
@@ -125,6 +177,7 @@ public final class SignLoader extends JavaPlugin {
         String mcVersion = detectMinecraftVersion();
         String loaderChannels = loaderCfg.getString("loader_channels", "release");
         CloudBlobLoader blobLoader = new CloudBlobLoader(getLogger(), "sign", loaderToken, mcVersion, loaderChannels);
+        blobLoader.expectedMagic(MAGIC);
         byte[] blob = blobLoader.resolve(pinnedVersion);
         byte[] aesKey = readResource(AES_KEY_RESOURCE);
         byte[] edPub = readResource(ED25519_PUB_RESOURCE);
