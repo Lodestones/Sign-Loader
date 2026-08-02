@@ -107,6 +107,12 @@ public final class SignLoader extends JavaPlugin {
             try { bootstrap.onDisable(this); } catch (Throwable t) { t.printStackTrace(); }
             bootstrap = null;
         }
+        if (!terminateShadedPacketEvents()) {
+            // Stranded netty handlers would spam "zip file closed" against a
+            // closed classloader — keep it (and the jar) alive instead.
+            getLogger().warning("Leaving the impl classloader open — PacketEvents handlers could not be ejected.");
+            return;
+        }
         if (implLoader != null) {
             try { implLoader.close(); } catch (IOException ignored) {}
             implLoader = null;
@@ -114,6 +120,36 @@ public final class SignLoader extends JavaPlugin {
         if (runtimeJar != null) {
             try { Files.deleteIfExists(runtimeJar); } catch (IOException ignored) {}
             runtimeJar = null;
+        }
+    }
+
+    private static final String SHADED_PACKETEVENTS = "com.github.retrooper.packetevents.sign.PacketEvents";
+
+    /**
+     * The impl shades PacketEvents and injects it into netty's channel
+     * pipelines during its onLoad. If the impl fails part-way (or the plugin
+     * is disabled), nothing ejects those handlers — once the impl classloader
+     * closes they throw "zip file closed" on every connection. Terminate PE
+     * through the impl loader before closing it.
+     *
+     * @return true when it is safe to close the impl classloader
+     */
+    private boolean terminateShadedPacketEvents() {
+        if (implLoader == null) return true;
+        Class<?> pe;
+        try {
+            pe = Class.forName(SHADED_PACKETEVENTS, false, implLoader);
+        } catch (ClassNotFoundException notShipped) {
+            return true;
+        }
+        try {
+            Object api = pe.getMethod("getAPI").invoke(null);
+            if (api == null) return true; // never initialized — nothing injected
+            api.getClass().getMethod("terminate").invoke(api);
+            return true;
+        } catch (Throwable t) {
+            getLogger().warning("Could not terminate shaded PacketEvents: " + t);
+            return false;
         }
     }
 
