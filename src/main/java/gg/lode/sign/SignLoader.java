@@ -30,6 +30,7 @@ import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.lang.reflect.Method;
 
 public final class SignLoader extends JavaPlugin {
 
@@ -143,9 +144,12 @@ public final class SignLoader extends JavaPlugin {
             return true;
         }
         try {
-            Object api = pe.getMethod("getAPI").invoke(null);
+            Method getApi = pe.getMethod("getAPI");
+            Object api = getApi.invoke(null);
             if (api == null) return true; // never initialized — nothing injected
-            api.getClass().getMethod("terminate").invoke(api);
+            // terminate() must resolve on the declared PacketEventsAPI type —
+            // the runtime instance is an inaccessible anonymous subclass.
+            getApi.getReturnType().getMethod("terminate").invoke(api);
             return true;
         } catch (Throwable t) {
             getLogger().warning("Could not terminate shaded PacketEvents: " + t);
