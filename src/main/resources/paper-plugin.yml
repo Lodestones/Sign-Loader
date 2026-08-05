@@ -18,6 +18,11 @@ dependencies:
     Amplifier:
       required: false
       load: BEFORE
+    # Frame owns scoreboard teams when present; Sign hands its nametag hiding
+    # to Frame's API rather than fighting it with team packets.
+    Frame:
+      required: false
+      load: BEFORE
     # Without these, Paper's isolated plugin classloader hides ViaVersion's
     # classes from the shaded PacketEvents, whose Via accessor then NPEs on
     # every incoming connection when ViaVersion is installed.
