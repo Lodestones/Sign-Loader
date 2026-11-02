@@ -10,7 +10,7 @@ plugins {
 
 group = 'gg.lode'
 
-def loaderVersion = '1.0.9'
+def loaderVersion = '1.0.10'
 version = loaderVersion
 
 java {
